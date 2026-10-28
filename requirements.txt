@@ -1,0 +1,6 @@
+customtkinter==6.0.0
+mss==10.2.0
+pillow==12.3.0
+pystray==0.19.5
+pywin32==312
+pynput==1.8.2

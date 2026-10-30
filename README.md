@@ -89,6 +89,18 @@ Behaviour when full and partial share keys (e.g. partial `Ctrl+Alt+M`, full `Ctr
 
 > Windows may reserve `PrSc` for Snipping Tool. If bare `PrSc` does not work, use `Ctrl+PrSc`, `Alt+PrSc`, or a modifier + letter (`Ctrl+Alt+F`, `Ctrl+Alt+S`).
 
+### Hotkeys survive suspend, lock and user switching
+
+A keyboard hook belongs to the desktop of the Windows session that installed it, so it can go silent after suspend, the lock screen or a fast user switch. CapturMDC recovers automatically:
+
+- It registers for Windows session notifications and **re-registers the hotkeys immediately** when the user logs on, unlocks the workstation, or reconnects to the console.
+- Independently, a watchdog re-installs the hook whenever no key event has been seen for **20 seconds** (checks every 5 seconds), which also covers a crashed listener or a resume without a session event.
+- If a release event was lost (the app thinks a modifier is still pressed), the watchdog **forgets those phantom keys after 10 seconds** of inactivity; otherwise every hotkey would stay blocked.
+- Re-registration never interrupts a capture in progress, and it never re-installs the hook while you are typing.
+- When the hook is re-armed you get the tray notification `Atajos reactivados`.
+
+**Fast user switching:** the process stays in the session that started it, so hotkeys only work in that session. If several users need captures, run `CapturMDC.exe` in each session (it starts automatically at logon if placed in the Startup folder).
+
 ---
 
 ## 5. Settings window
@@ -106,7 +118,7 @@ Fields and valid ranges:
 | Full capture hotkey | See rules in section 4 | `Ctrl+PrSc` |
 | Partial capture hotkey | See rules in section 4 | `PrSc` |
 | Partial capture delay (s) | 0.05–1.50 | 0.25 |
-| Autosave to file | On/off | On |
+| Autosave to file | On/off (the clipboard is always used; this only adds a file) | On |
 
 `max_capture_timeout` (1–300 s) and `pause_resume_transition` (0–5 s) have no widget in the window: edit them in `config.json`.
 
@@ -114,9 +126,14 @@ Fields and valid ranges:
 
 While the settings window is open, hotkeys are blocked (notified at most once every 2.5 s).
 
-### Without autosave
+### The clipboard is always used
 
-If you turn *Autoguardar en archivo* off, the capture is copied to the **Windows clipboard** as an image (`CF_DIB`) and you can paste it (`Ctrl+V`) into Paint, Word, Slack, email, etc. The red hint line indicates that no file will be written.
+Every capture — full or partial — is copied to the **Windows clipboard** as an image (`CF_DIB`), so you can paste it (`Ctrl+V`) into Paint, Word, Slack, email, etc.:
+
+- **Autosave on**: the file is written **and** the image lands in the clipboard. Notification: `Guardado: C:\...\Screenshot_20261030_103135.png · Copiado al portapapeles`.
+- **Autosave off**: only the clipboard; no file is written (the hint line turns red).
+
+If the file write fails (folder not writable, name collision), the clipboard copy still happens and the notification shows `Error al guardar: …`. If another app holds the clipboard, the file is still saved and you see `Error al copiar al portapapeles: …`.
 
 ---
 
@@ -134,7 +151,7 @@ If the box covered something you wanted to see, press `Esc` and capture again.
 
 ## 7. Where images are stored
 
-- Folder: the configured one (default `%USERPROFILE%\Pictures\CapturMDC`).
+- Folder: the configured one (default `%USERPROFILE%\Pictures\CapturMDC`), only when autosave is on.
 - Name: pattern + timestamp built from the chosen strftime format.
   With defaults: `Screenshot_20261028_172955.png`.
 - Invalid characters (`< > : " / \ | ? *`) are stripped from the name; reserved Windows names (`CON`, `PRN`, `AUX`, `NUL`, `COM1–9`, `LPT1–9`) are not used as the final name.
@@ -155,9 +172,12 @@ The tray shows short messages:
 
 - `Guardado: C:\...\Screenshot_...png` (saved)
 - `Copiado al portapapeles` (copied to clipboard)
+- `Guardado: … · Copiado al portapapeles` (autosave on: both outputs)
+- `Error al guardar: …` / `Error al copiar al portapapeles: …`
 - `Selección cancelada` (selection cancelled)
 - `Capturas en pausa` / `Capturas activas` (paused / active)
 - `Configuración guardada` (settings saved)
+- `Atajos reactivados` (hotkeys re-registered after a session change or keepalive)
 - Blocked states (at most once every 2.5 s): `Captura en curso, espera a que termine`, `Capturas en pausa: usa Pausar/Reanudar en el menú de la bandeja`, `Ventana de configuración abierta: los atajos están bloqueados`, `Selección parcial en curso`, `Cambio de pausa/reanudar en curso`
 - Errors: `Error de captura: …`, `Error de selección: …`
 
@@ -198,6 +218,8 @@ Changes made in the file take effect after restarting the app (changes made in t
 | Symptom | Cause / fix |
 | --- | --- |
 | Icon does not appear | Wait 2–3 s (onefile start-up). If it persists, run the source to see console errors |
+| Hotkeys stop working after suspend, lock or switching users | Automatic: the hook is re-registered on logon/unlock and after 20 s of silence (`Atajos reactivados`). If you switch users, run the app in each session |
+| Hotkeys silent but the tray menu still works | Release all keys and press again; a phantom "still held" key is forgotten after 10 s of inactivity and the hook is re-installed automatically |
 | Bare `PrSc` captures nothing | Windows reserves `PrSc` for Snipping Tool: use `Ctrl+PrSc` or modifier + letter |
 | Partial fires when you wanted full | Raise *Partial capture delay* (0.3–0.6 s) and press `Shift` before releasing |
 | Nothing captures, "Captura en curso" shown | A previous capture is still active (selection open or save in progress); wait or press `Esc` |
@@ -210,7 +232,8 @@ Changes made in the file take effect after restarting the app (changes made in t
 
 ## 12. Known limitations
 
-- Windows only (tray, `CF_DIB` clipboard, DPI).
+- Windows only (tray, `CF_DIB` clipboard, DPI, WTS session notifications).
 - Hotkeys limited to `PrSc` and letters with modifiers.
 - One capture at a time (no capture queue).
+- Keyboard hooks are per-session: after a fast user switch, the instance keeps running in its own session, so each user session needs its own instance.
 - The partial capture uses the full virtual screen (monitors with negative offsets included); the overlay covers that area.

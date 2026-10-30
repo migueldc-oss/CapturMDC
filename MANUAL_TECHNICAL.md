@@ -1,6 +1,6 @@
 # Technical / functional manual — CapturMDC
 
-A Windows tray application with no visible main window, global keyboard hotkeys, full-screen or partial capture (over a frozen snapshot), output to a PNG/JPG file or to the clipboard as `CF_DIB`.
+A Windows tray application with no visible main window, global keyboard hotkeys, full-screen or partial capture (over a frozen snapshot), output copied to the clipboard as `CF_DIB` always, plus a PNG/JPG file when autosave is enabled.
 
 ---
 
@@ -10,7 +10,8 @@ A Windows tray application with no visible main window, global keyboard hotkeys,
 | --- | --- | --- |
 | `__main__.py` | Entry point: hidden Tk root, action queue, state flags, orchestration of capture/pause/settings | `capture`, `config`, `hotkeys`, `selection`, `tray`, `settings`, `customtkinter` |
 | `config.py` | Defaults, load/save of `%APPDATA%\CapturMDC\config.json`, strict or lenient validation, filename sanitization | `hotkeys` |
-| `hotkeys.py` | Hotkey normalization/validation and exact held-key controller | `pynput`, `threading` |
+| `hotkeys.py` | Hotkey normalization/validation, exact held-key controller, keepalive watchdog | `pynput`, `threading` |
+| `session.py` | Windows session notifications (`WM_WTSSESSION_CHANGE`) so hooks can be re-registered | `ctypes` (user32, kernel32, wtsapi32) |
 | `capture.py` | DPI-aware `mss` grabs, PNG/JPG saving, `CF_DIB` construction, clipboard copy | `mss`, `PIL`, `win32clipboard`, `ctypes` |
 | `selection.py` | Tk selection overlay drawn over the frozen snapshot; returns a cropped image | `tkinter`, `PIL`, `PIL.ImageTk` |
 | `settings.py` | CTk settings window with validation and dynamic visibility | `customtkinter`, `tkinter`, `config` |
@@ -49,6 +50,12 @@ threading.Timer threads (daemon)
 
 pystray.Icon.run thread (daemon)
   └─ menu events -> App._post_action
+
+HotkeyController watchdog thread (daemon)
+  └─ every WATCHDOG_INTERVAL -> reattach() -> re-install the hook if needed
+
+SessionWatcher thread (daemon)
+  └─ message-only window + GetMessageW loop -> WM_WTSSESSION_CHANGE -> App._on_session_change
 ```
 
 - Every action (hotkey or menu) goes through a `queue.Queue[str]` and is processed **only** on the Tk mainloop thread. pynput/pystray callbacks never touch Tk directly.
@@ -140,6 +147,30 @@ State per press: `_held: dict[event -> token]`, `_unsupported: dict[event -> rep
 
 Practical consequence: with partial `Ctrl+Alt+M` and full `Ctrl+Alt+Shift+M`, pressing the first two fires full if `Shift` is added before the delay elapses; otherwise it fires partial. That is why `partial_delay` is configurable.
 
+### Recovery after suspend, lock or user switch
+
+A `WH_KEYBOARD_LL` hook is bound to the desktop/window station of the session that installed it, so it stops delivering events after suspend, the lock screen or a fast user switch. Two mechanisms fix this:
+
+**Session notifications (`session.py`)**
+
+- `SessionWatcher` registers a window class (`RegisterClassExW`), creates a message-only window (`CreateWindowExW` with parent `HWND_MESSAGE`) in a daemon thread, and calls `WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_ALL_SESSIONS)` (`wtsapi32`).
+- It uses **private `ctypes.WinDLL("user32"/"kernel32"/"wtsapi32")` instances**. Declaring `argtypes` on the shared `ctypes.windll.user32.GetMessageW` would overwrite pynput's own signature (`c_voidp` for the `MSG` pointer) and make pynput's message loop raise `ArgumentError`, killing the keyboard listener thread — the exact symptom of "tray works, hotkeys do not".
+- The thread runs a `GetMessageW` loop; `WM_WTSSESSION_CHANGE` (`0x02B1`) is handled in the window procedure and reported through a callback. `PostThreadMessageW(thread_id, WM_QUIT)` ends the loop; teardown unregisters the WTS notification, destroys the window and unregisters the class. Class names are unique per instance (`CapturMDCSessionWatcher-<id>`), so start/stop cycles never reuse a stale window procedure.
+- The thread runs a `GetMessageW` loop; `WM_WTSSESSION_CHANGE` (`0x02B1`) is handled in the window procedure and reported through a callback. `PostThreadMessageW(thread_id, WM_QUIT)` ends the loop; teardown unregisters the WTS notification, destroys the window and unregisters the class. Class names are unique per instance (`CapturMDCSessionWatcher-<id>`), so start/stop cycles never reuse a stale window procedure.
+- `RESUME_EVENTS = {SESSION_CONNECT, CONSOLE_CONNECT, LOGON, UNLOCK, REMOTE_CONNECT}`; `App._on_session_change` forces `hotkeys.reattach(force=True)`, clears the blocked reason, calls `tray.refresh()` and notifies `Atajos reactivados` when the hook was actually re-armed. Lock/logoff events are ignored (no keys can be pressed anyway).
+- If `wtsapi32` registration fails, the app keeps running: the keepalive below still recovers. A diagnostic line is printed to stderr.
+
+**Keepalive watchdog (`hotkeys.py`)**
+
+- `_touch()` records the last hook event in `_last_event`; `_last_reattach` records the last re-arm.
+- `KEEPALIVE_INTERVAL = 20.0` s of total silence means the hook is probably dead (a dead hook receives nothing, so silence is the signal), and `reattach()` re-arms it. The watchdog thread checks every `WATCHDOG_INTERVAL = 5.0` s, so recovery is ≤ ~25 s even without session events (or when the listener thread died from an exception).
+- `reattach(force=False)`: returns `False` when the listener is running, alive and the last event/reattach is fresher than the interval, so healthy hooks are never re-installed while typing. `force=True` is used by the session handler.
+- `_restart_listener()` installs the **new** hook *before* stopping the old listener (pynput listeners cannot be restarted once stopped), so there is no blind window between hooks; only then it stops/joins the old listener (`join(timeout=2.0)`) and calls `reset()`. If installing the new hook fails, it drops the old one and retries once; the next watchdog tick tries again.
+- `reattach()` defers (returns `False`) while a combination is in flight — a pending partial timer, keys still held, or `_full_fired` — so a re-arm never drops a capture that is mid-flight; the next tick re-arms once idle.
+- `_sweep_stuck_keys()` forgets keys whose release event never arrived (missed releases leave a phantom modifier held forever and block every hotkey). It only sweeps after `STALE_KEYS_INTERVAL = 10.0` s of hook silence, so a combination being typed is never cleared.
+- `stop()` sets `_stopping` first so the watchdog cannot resurrect a listener during shutdown, signals the stop event and joins the watchdog thread before stopping the hook.
+- Shutdown order in `App._shutdown()`: session watcher → hotkeys → tray → settings.
+
 ---
 
 ## 5. Capture (`capture.py`)
@@ -218,7 +249,7 @@ Flow (`select_image(master, snapshot, monitor)`):
 - Quality: slider 1–100 with a value label.
 - Pattern / strftime / hotkeys: entries with placeholders.
 - Partial delay: slider 0.05–1.5 (29 steps) → stored as `partial_delay` (no duplicate assignment that would ignore the slider).
-- Autosave: checkbox + hint; the hint turns red when disabled (clipboard mode).
+- Autosave: checkbox + hint. When on, the hint reads "Siempre se copia al portapapeles … además se guarda el archivo" in gray; when off, it reads "Sólo se copia al portapapeles …: no se escribe ningún archivo" in red.
 - `collect()` returns the full dict; `max_capture_timeout` and `pause_resume_transition` are preserved from `_cfg`.
 - `_save()` runs `validate_config(..., strict=True)`; a `ValueError` is displayed in the red `error_label` and the window stays open. Only if validation succeeds it calls `on_save` (which persists and reconfigures the controller) and closes.
 - `WM_DELETE_WINDOW` → `on_close` → `App._settings_closed()` (releases the hotkey block and calls `hotkeys.reset()`).
@@ -235,10 +266,23 @@ Applying new settings (`App._apply_config`): `config.save_config`, `self.cfg = v
 exact press (full) -> queue "capture_full" -> _dispatch -> allow predicates -> _capture_full
   _busy=True
   capture.grab_full_image()   # mss monitors[0], RGB
-  _emit_image: autosave ? save_image(PNG/JPG) : copy_image_to_clipboard(CF_DIB)
-  notify
+  _emit_image(image)
   _busy=False
 ```
+
+`_emit_image(image)` is the single output path used by both capture types:
+
+```
+parts = []
+if cfg["autosave"]:
+    try: parts.append("Guardado: " + self._save_image(image))
+    except Exception: parts.append("Error al guardar: ...")   # clipboard still attempted
+try: capture.copy_image_to_clipboard(image); parts.append("Copiado al portapapeles")
+except Exception: parts.append("Error al copiar al portapapeles: ...")
+tray.notify(" · ".join(parts))
+```
+
+So autosave on = file **and** clipboard; autosave off = clipboard only. A failure in one output never prevents the other.
 
 ### Partial capture
 
@@ -249,12 +293,11 @@ exact press (partial) -> Timer after partial_delay -> queue "capture_partial"
   monitor  = capture.get_virtual_monitor()
   image    = selection.select_image(root, snapshot, monitor)   # wait_variable
   image is None -> notify "Selección cancelada"
-  else -> _emit_image(image)                # crop of the frozen image
+  else -> _emit_image(image)                # crop of the frozen image: clipboard (+ file if autosave)
   _selection_active=False, _busy=False
 ```
 
 ### Pause / resume
-
 ```
 toggle_pause -> ignored if busy or in transition
   _paused = not _paused; _blocked_reason=None
@@ -275,10 +318,14 @@ toggle_pause -> ignored if busy or in transition
 | Unreadable/corrupt `config.json` | Lenient load: per-key defaults |
 | Writing `config.json` fails | stderr, capture still works in memory |
 | Save folder not writable | Falls back to the default and notifies; if that also fails, the default string is used |
-| Clipboard busy | 8 retries of 50 ms, then `RuntimeError("El portapapeles de Windows está ocupado")` |
+| File write fails during a capture | `Error al guardar: ...` notification; the clipboard copy is still attempted |
+| Clipboard busy | 8 retries of 50 ms, then `Error al copiar al portapapeles: ...` notification; the file is still saved when autosave is on |
 | `GlobalAlloc/Lock/SetClipboardData` failures | `GlobalFree` of the handle and `Error de captura: ...` notification |
 | Empty image | `ValueError("La imagen capturada está vacía")` in `build_dib` |
 | Alpha/topmost unsupported | `TclError` ignored (overlay still usable) |
+| Session notification unavailable (`wtsapi32` fails) | stderr diagnostic; keepalive watchdog still re-arms the hook |
+| Hook silent for 20 s (suspend, desktop switch, dead listener) | Watchdog stops the old listener and installs a new one, then `reset()` |
+| `Listener` install/restart raises | Swallowed; retried on the next watchdog tick |
 | Notification failures | Silenced |
 
 ---
@@ -322,6 +369,13 @@ Note: if the exe is running, the build cannot overwrite it (`PermissionError`); 
 - Selection with synthetic canvas events (mouse injection via `SendInput` returns 0 in this environment): correct region, crop identical to the frozen snapshot, drag < 6 px cancels, `Esc` cancels.
 - Clipboard: round-trip identical for pure colours, gradients, full screen and region; saved bytes and clipboard payload match; header `(40, W, H, 1, 24, 0)`.
 - Frozen executable: imports of `pynput`, `pystray._win32`, `customtkinter`, `mss`, `win32clipboard/gui/api`, PIL OK; full cycle full → partial (overlay open, full ignored) → `Esc` → full again; clean shutdown.
+- Session watcher: message-only window created, `WTSRegisterSessionNotification` succeeded, simulated `WM_WTSSESSION_CHANGE` delivered to the callback (unlock/logon/console connect), lock delivered but not treated as a resume event, `stop()` destroys the window and a second watcher instance can start in the same process.
+- ctypes clash regression: before the fix, importing `session` turned pynput's `MessageLoop._GetMessage.argtypes[0]` into `LP_MSG` and its own call raised `ArgumentError` (listener thread dies, hotkeys silent); after the fix the argtypes stay `(c_void_p, c_void_p, c_ulong, c_ulong)` and no pynput error is logged for 12+ s with the watchdog running (checked in source and in the frozen exe).
+- Keepalive: full/partial combos fire, then the hook was force-stopped to emulate a session change; the watchdog re-armed a new listener within ~3.5 s and the next combo fired again; `reattach(force=True)` re-armed immediately; `reattach()` on a fresh healthy hook returns `False` (no needless re-install); `stop()` leaves no live listener or watchdog thread.
+- Stuck keys: pressing `Ctrl+Alt` plus an unsupported key without releasing them blocks both hotkeys; after the stale-keys sweep the state is empty and both hotkeys fire again; keys held while fresh are not swept.
+- Dual output: with autosave on a full capture wrote `Screenshot_*.png` **and** updated the clipboard (`CF_DIB`, 24,883,240 bytes, header `(40, 3840, 2160, 1, 24, 0)`); with autosave off the clipboard updated again with no new file. A partial capture (auto-drag crop 320x220) wrote a 6,340-byte PNG and put the same crop on the clipboard (`CF_DIB`, 211,240 bytes, header `(40, 320, 220, 1, 24, 0)`).
+- Keepalive: full/partial combos fire, then the hook was force-stopped to emulate a session change; the watchdog re-armed a new listener within ~3.5 s and the next combo fired again; `reattach(force=True)` re-armed immediately; `reattach()` on a fresh healthy hook returns `False` (no needless re-install); `stop()` leaves no live listener or watchdog thread.
+- App integration: watcher active on start, `App._on_session_change(UNLOCK)` re-created the listener and a full capture saved a file afterwards; a second forced hook loss was recovered by the watchdog alone and a partial capture completed (3 files total, clean shutdown).
 
 ---
 
@@ -330,8 +384,10 @@ Note: if the exe is running, the build cannot overwrite it (`PermissionError`); 
 - Exact matching: any extra unsupported held key invalidates a trigger.
 - Supported base keys: `PrSc` and `a–z` with a modifier.
 - One capture at a time (`_busy`); no queue.
+- Keyboard hooks are per-session: after a fast user switch, the process stays in its own session/desktop, so each user session that needs hotkeys must run its own instance. Re-registering helps in the *current* session (suspend, lock, console reconnect), not in another user's session.
+- Re-arming the hook while keys are held drops the held state (`reset()`), so the combination must be pressed again; this is why the keepalive only acts after a 20 s silence.
 - The selection overlay covers the whole virtual screen; in multi-monitor setups with negative coordinates the geometry is derived from `monitors[0]`.
-- `CF_DIB` delivers 24 bpp RGB without an alpha channel; PNG keeps the original on disk.
+- `CF_DIB` delivers 24 bpp RGB without an alpha channel; PNG keeps the original on disk. The clipboard holds only the last capture (one clipboard, overwritten each time).
 - Some third-party apps may interpret the DIB their own way (their own flipping/scaling); the payload follows the Windows specification.
 - Freezing the screen means the partial capture does not reflect changes made after the key press (this is the intended behaviour).
 
@@ -343,4 +399,6 @@ Note: if the exe is running, the build cannot overwrite it (`PermissionError`); 
 - New formats: extend `normalize_output_format` and `save_image` (e.g. WebP with Pillow).
 - Copy a file to the clipboard: add `CF_HDROP`, or `CF_DIB` + `CF_BITMAP` in `capture.copy_image_to_clipboard`.
 - Sound / pause hotkey: new action in `App._dispatch` + item in `tray.py`.
+- Session events: extend `RESUME_EVENTS` or add `WM_DEVICE_BROADCAST`/power handling in `SessionWatcher._window_proc`.
+- Keepalive tuning: `HotkeyController(keepalive_interval=..., watchdog_interval=...)` (defaults 20 s / 5 s); could be exposed as config keys.
 - Without freezing the screen: replace `select_image(root, snapshot, monitor)` with a live selection + `grab_region_image(region)`.

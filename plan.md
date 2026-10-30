@@ -8,7 +8,7 @@
 - Hidden Tk/customtkinter root and mainloop with queue polling.
 - Settings window opened from tray left click.
 - Tray menu actions and pause/resume hotkey control.
-- Capture output saved as PNG or JPG, or copied to clipboard when autosave is disabled.
+- Capture output is always copied to the Windows clipboard (CF_DIB); when autosave is enabled the PNG/JPG file is written as well.
 
 ## Modules
 - `config.py`: JSON config load/save, defaults, validation, save directory checks, filename sanitization.
@@ -44,6 +44,10 @@
 - Partial hotkey schedules after delay and cancels on full exact match, unsupported keys held, busy/paused state, pause/resume transition, or timeout. Releasing keys does not cancel it, so a quick tap of the partial combination still fires after the delay.
 - Unsupported held keys invalidate exact hotkey matching.
 - Hotkey presses are ignored while busy, paused, settings open, selection active, or transition active.
+- Hotkeys must survive suspend/lock/user switching: listen for `WM_WTSSESSION_CHANGE` and re-register the hook on logon/unlock/console reconnect.
+- A keepalive watchdog re-installs the keyboard hook after 20 s with no key events (checked every 5 s), because a dead hook delivers nothing; the new hook is installed before the old listener is stopped, and a re-arm never drops a combination in flight.
+- The watchdog also forgets held keys whose release event never arrived after 10 s of silence, so a phantom modifier cannot block every hotkey.
+- Session code must use private `ctypes.WinDLL("user32")` instances: declaring `argtypes` on the shared `ctypes.windll.user32.GetMessageW` overrides pynput's signature and kills the keyboard listener thread.
 
 ## Capture rules
 - Full capture uses `ctypes.windll.user32.SetProcessDPIAware()` and `mss.monitors[0]`.
@@ -68,7 +72,7 @@
 
 
 # Objective
-Implement the Windows-only background tray app CapturMDC with global full/partial screenshot hotkeys, PNG/JPG saving or Windows clipboard copy when autosave is disabled, Spanish tray actions, and a dark/light settings window without a visible main app window.
+Implement the Windows-only background tray app CapturMDC with global full/partial screenshot hotkeys, clipboard copy (CF_DIB) on every capture plus PNG/JPG saving when autosave is enabled, Spanish tray actions, and a dark/light settings window without a visible main app window.
 Important Details
 Destination folder: <PROJECT>\CapturMDC.
 Target interpreter: <PROJECT>\.venv\Scripts\python.exe.
@@ -139,6 +143,7 @@ Partial selection as plain tk.Toplevel attached to the hidden root.
 Tray callbacks and hotkey listener actions put actions into a thread-safe queue consumed by the Tk mainloop.
 Action queue items should include at least capture_full, capture_partial, open_settings, toggle_pause, and quit.
 Allow-action predicate should block hotkeys while exiting, busy, paused, settings open, selection active, or transition active.
+Session recovery: a message-only window registered with WTS notifications triggers an immediate hook re-registration on resume events, and a watchdog thread re-arms the hook after prolonged silence.
 Tray capture actions should be allowed while paused unless busy/transition blocks them.
 Tray pause/resume transition should use pause_resume_transition seconds via time.monotonic().
 Import strategy:
@@ -191,7 +196,7 @@ win32gui.
 pynput 1.8.2.
 Hotkey behavior requirements and validation rules approved.
 Tray interaction behavior approved: left click opens Settings via default menu item.
-Clipboard behavior approved: disabled autosave copies image to Windows clipboard using CF_DIB.
+Clipboard behavior approved: every capture copies the image to the Windows clipboard using CF_DIB; autosave additionally writes the PNG/JPG file. A failure in one output must not prevent the other.
 Runtime facts for pynput Print Screen token and DPI-awareness method confirmed.
 Customtkinter widget API attributes verified.
 Module implementation design has been outlined:
@@ -260,6 +265,7 @@ Relevant Files
 <PROJECT>\CapturMDC\selection.py: to implement full virtual-screen partial selection overlay.
 <PROJECT>\CapturMDC\settings.py: to implement dark/light settings CTkToplevel.
 <PROJECT>\CapturMDC\tray.py: to implement pystray tray icon and Spanish menu actions.
+<PROJECT>\CapturMDC\session.py: to implement Windows session notifications (WM_WTSSESSION_CHANGE) for hotkey re-registration.
 <PROJECT>\CapturMDC\__main__.py: to implement hidden root/mainloop, queue polling, action dispatch, and orchestration.
 <PROJECT>\CapturMDC\requirements.txt: to list dependencies.
 <PROJECT>\.venv\Scripts\python.exe: target interpreter for syntax and runtime validatio

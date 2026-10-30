@@ -66,6 +66,17 @@ VK_LETTER_TOKENS: Dict[int, str] = {vk: chr(vk).lower() for vk in range(0x41, 0x
 
 ActionCallback = Callable[[str], None]
 
+#: Re-install the keyboard hook when no key event has been seen for this long.
+#: A hook left on an inactive desktop delivers nothing, so silence is the signal
+#: that it must be re-armed (suspend, lock screen, fast user switch).
+KEEPALIVE_INTERVAL = 20.0
+
+#: How often the watchdog thread checks the listener state.
+WATCHDOG_INTERVAL = 5.0
+
+#: Drop held keys that were never reported released (missed release events).
+STALE_KEYS_INTERVAL = 10.0
+
 
 def _is_letter(token: str) -> bool:
     return len(token) == 1 and "a" <= token <= "z"
@@ -199,6 +210,11 @@ class HotkeyController:
     full hotkey becomes an exact match, an unsupported key is held, the allow
     predicate turns false, or the capture timeout elapses. Releasing the keys
     does not cancel it, so a quick tap of the partial combination still fires.
+
+    A background watchdog keeps the hook working across suspend/lock/session
+    changes: it re-arms the hook after ``keepalive_interval`` seconds without
+    any hook event, defers while a combination is in flight, and forgets keys
+    whose release was never delivered after ``stale_keys_interval`` seconds.
     """
 
     def __init__(
@@ -209,6 +225,9 @@ class HotkeyController:
         allow_action: Optional[Callable[[], bool]] = None,
         partial_delay: float = 0.25,
         max_capture_timeout: float = 30.0,
+        keepalive_interval: float = KEEPALIVE_INTERVAL,
+        watchdog_interval: float = WATCHDOG_INTERVAL,
+        stale_keys_interval: float = STALE_KEYS_INTERVAL,
     ) -> None:
         self._callback = callback
         self._allow = allow_action or (lambda: True)
@@ -229,6 +248,14 @@ class HotkeyController:
 
         self._listener = None
         self._started = False
+        self._stopping = False
+        self._keepalive_interval = max(1.0, float(keepalive_interval))
+        self._watchdog_interval = max(0.5, float(watchdog_interval))
+        self._stale_keys_interval = max(1.0, float(stale_keys_interval))
+        self._last_event = time.monotonic()
+        self._last_reattach = 0.0
+        self._watchdog_stop = threading.Event()
+        self._watchdog_thread: Optional[threading.Thread] = None
 
     # ------------------------------------------------------------------ config
     def set_hotkeys(
@@ -329,7 +356,12 @@ class HotkeyController:
             pass
 
     # ---------------------------------------------------------------- listener
+    def _touch(self) -> None:
+        """Record that the hook delivered an event (keepalive heartbeat)."""
+        self._last_event = time.monotonic()
+
     def _on_press(self, key: object) -> None:
+        self._touch()
         token = key_token(key)
         with self._lock:
             if token is None:
@@ -356,6 +388,7 @@ class HotkeyController:
             self._cancel_partial_timer()
 
     def _on_release(self, key: object) -> None:
+        self._touch()
         token = key_token(key)
         with self._lock:
             if token is None:
@@ -381,16 +414,135 @@ class HotkeyController:
                     self._partial_fired = False
                     self._partial_deadline = None
 
+    def _start_listener(self) -> bool:
+        if Key is None:
+            return False
+        from pynput.keyboard import Listener
+
+        try:
+            listener = Listener(on_press=self._on_press, on_release=self._on_release)
+            listener.start()
+        except Exception:  # pragma: no cover - hook installation can fail
+            return False
+        self._listener = listener
+        self._started = True
+        return True
+
+    def _restart_listener(self) -> bool:
+        """Install a brand new hook; a stopped pynput listener cannot restart.
+
+        The new hook is installed before the old listener is stopped so there is
+        no blind window in which keys could be missed.
+        """
+        old = self._listener
+        now = time.monotonic()
+        self._last_event = now
+        self._last_reattach = now
+        if self._start_listener():
+            if old is not None:
+                try:
+                    old.stop()
+                except Exception:  # pragma: no cover - defensive
+                    pass
+                try:
+                    old.join(timeout=2.0)
+                except Exception:  # pragma: no cover - join reraises listener errors
+                    pass
+            self.reset()
+            return True
+
+        # New hook failed: drop the old one and retry once.
+        if old is not None:
+            try:
+                old.stop()
+            except Exception:  # pragma: no cover - defensive
+                pass
+            try:
+                old.join(timeout=2.0)
+            except Exception:  # pragma: no cover - defensive
+                pass
+        self._listener = None
+        self._started = False
+        self.reset()
+        return self._start_listener()
+
+    def reattach(self, force: bool = False) -> bool:
+        """Re-arm the keyboard hook when it died or has gone silent.
+
+        Returns ``True`` when the hook was re-installed. Called by the watchdog
+        periodically and directly on Windows session events (logon/unlock).
+        """
+        if self._stopping or Key is None:
+            return False
+        listener = self._listener
+        alive = bool(
+            self._started
+            and listener is not None
+            and getattr(listener, "running", False)
+            and listener.is_alive()
+        )
+        now = time.monotonic()
+        stale_after = 0.0 if force else self._keepalive_interval
+        reference = max(self._last_event, self._last_reattach)
+        if alive and (now - reference) < stale_after:
+            return False
+        with self._lock:
+            in_flight = self._partial_timer is not None or bool(self._held) or self._full_fired
+        if in_flight:
+            # Re-arm on the next tick instead: resetting now would drop a
+            # combination that is mid-flight (partial timer or keys still held).
+            return False
+        return self._restart_listener()
+
+    def _sweep_stuck_keys(self) -> None:
+        """Forget held keys whose release event never arrived.
+
+        A hook can miss releases (desktop switch, re-arm), which would leave a
+        phantom modifier held forever and block every hotkey. Only sweeps when
+        the hook has been silent for ``stale_keys_interval`` seconds.
+        """
+        if time.monotonic() - self._last_event < self._stale_keys_interval:
+            return
+        with self._lock:
+            if not self._held and not self._unsupported:
+                return
+        self.reset()
+
+    def _start_watchdog(self) -> None:
+        if self._watchdog_thread is not None and self._watchdog_thread.is_alive():
+            return
+        self._watchdog_stop.clear()
+        thread = threading.Thread(
+            target=self._watchdog_loop, name="CapturMDC-hotkey-watchdog", daemon=True
+        )
+        self._watchdog_thread = thread
+        thread.start()
+
+    def _watchdog_loop(self) -> None:
+        while not self._watchdog_stop.wait(self._watchdog_interval):
+            try:
+                self._sweep_stuck_keys()
+                self.reattach()
+            except Exception:  # pragma: no cover - the watchdog must never die
+                pass
+
     def start(self) -> None:
         if self._started or Key is None:
             return
-        from pynput.keyboard import Listener
-
-        self._listener = Listener(on_press=self._on_press, on_release=self._on_release)
-        self._listener.start()
-        self._started = True
+        self._stopping = False
+        self._start_listener()
+        self._start_watchdog()
 
     def stop(self) -> None:
+        self._stopping = True
+        self._watchdog_stop.set()
+        thread = self._watchdog_thread
+        self._watchdog_thread = None
+        if thread is not None:
+            try:
+                thread.join(timeout=self._watchdog_interval + 0.5)
+            except Exception:  # pragma: no cover - defensive
+                pass
         self._cancel_partial_timer()
         listener = self._listener
         self._listener = None

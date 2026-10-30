@@ -19,6 +19,7 @@ import capture
 import config
 import hotkeys
 import selection
+import session
 import tray
 from settings import SettingsWindow
 
@@ -76,6 +77,9 @@ class App:
             is_paused=lambda: bool(self._paused),
             title="CapturMDC",
         )
+        # Windows tells us when the user logs on / unlocks / switches sessions so
+        # the keyboard hook can be re-registered on the active desktop.
+        self.session_watch = session.SessionWatcher(on_event=self._on_session_change)
 
     # ------------------------------------------------------------------ plumbing
     def _post_action(self, action: str) -> None:
@@ -120,6 +124,20 @@ class App:
     def _in_transition(self) -> bool:
         return time.monotonic() < self._transition_until
 
+    def _on_session_change(self, event: int) -> None:
+        """Re-register hotkeys when Windows reports the user is back."""
+        if event not in session.RESUME_EVENTS:
+            return
+        self._blocked_reason = None
+        try:
+            reattached = self.hotkeys.reattach(force=True)
+        except Exception as exc:  # pragma: no cover - defensive
+            print(f"CapturMDC: no se pudieron re-registrar los atajos ({exc})", file=sys.stderr)
+            return
+        self.tray.refresh()
+        if reattached:
+            self.tray.notify("Atajos reactivados")
+
     def _prepare_save_dir(self, path: str) -> str:
         try:
             return config.ensure_save_dir(path)
@@ -135,6 +153,8 @@ class App:
         self.tray.start()
         self.tray.refresh()
         self.hotkeys.start()
+        if not self.session_watch.start():
+            print("CapturMDC: aviso de sesión de Windows no disponible (keepalive activo)", file=sys.stderr)
         self.root.after(POLL_MS, self._poll)
 
     def run(self) -> None:
@@ -201,17 +221,22 @@ class App:
             self._busy = False
 
     def _emit_image(self, image: Any) -> None:
-        """Save the image to disk, or copy it to the clipboard when autosave is off."""
-        try:
-            if bool(self.cfg["autosave"]):
+        """Always copy to the clipboard; also write the file when autosave is on."""
+        parts: list[str] = []
+        if bool(self.cfg["autosave"]):
+            try:
                 path = self._save_image(image)
                 if path:
-                    self.tray.notify(f"Guardado: {path}")
-            else:
-                capture.copy_image_to_clipboard(image)
-                self.tray.notify("Copiado al portapapeles")
+                    parts.append(f"Guardado: {path}")
+            except Exception as exc:
+                parts.append(f"Error al guardar: {exc}")
+        try:
+            capture.copy_image_to_clipboard(image)
+            parts.append("Copiado al portapapeles")
         except Exception as exc:
-            self.tray.notify(f"Error de captura: {exc}")
+            parts.append(f"Error al copiar al portapapeles: {exc}")
+        if parts:
+            self.tray.notify(" · ".join(parts))
 
     def _save_image(self, image: Any) -> str:
         save_dir = config.ensure_save_dir(self.cfg["save_path"])
@@ -283,6 +308,10 @@ class App:
 
     def _shutdown(self) -> None:
         self._exiting = True
+        try:
+            self.session_watch.stop()
+        except Exception:  # pragma: no cover - defensive
+            pass
         try:
             self.hotkeys.stop()
         except Exception:  # pragma: no cover - defensive

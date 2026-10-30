@@ -174,7 +174,7 @@ class SettingsWindow(ctk.CTkToplevel):
 
         self.clipboard_hint = ctk.CTkLabel(
             body,
-            text="Sin autoguardar: la captura se copia al portapapeles de Windows (CF_DIB).",
+            text="",
             text_color=HINT_COLOR,
             wraplength=420,
             justify="left",
@@ -234,7 +234,14 @@ class SettingsWindow(ctk.CTkToplevel):
 
     def _on_autosave_change(self) -> None:
         enabled = bool(self.autosave_var.get())
-        self.clipboard_hint.configure(text_color=ERROR_COLOR if not enabled else HINT_COLOR)
+        self.clipboard_hint.configure(
+            text=(
+                "Siempre se copia al portapapeles de Windows (CF_DIB); con autoguardar además se guarda el archivo."
+                if enabled
+                else "Sólo se copia al portapapeles de Windows (CF_DIB): no se escribe ningún archivo."
+            ),
+            text_color=HINT_COLOR if enabled else ERROR_COLOR,
+        )
 
     def _browse(self) -> None:
         try:
